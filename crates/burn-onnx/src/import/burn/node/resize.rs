@@ -104,6 +104,39 @@ impl NodeCodegen for onnx_ir::node::resize::ResizeNode {
                         .init();
                 },
             ))
+        } else if input_rank == 5 {
+            let size = match &self.config.sizes {
+                Some(ResizeSizes::Static(sizes)) if sizes.len() >= 3 => {
+                    let d = sizes[0].to_tokens();
+                    let h = sizes[1].to_tokens();
+                    let w = sizes[2].to_tokens();
+                    quote! { Some([#d, #h, #w]) }
+                }
+                _ => quote! { None },
+            };
+
+            let scale_factor = match &self.config.scales {
+                Some(ResizeScales::Static(scales)) if scales.len() >= 3 => {
+                    let d = scales[0].to_tokens();
+                    let h = scales[1].to_tokens();
+                    let w = scales[2].to_tokens();
+                    quote! { Some([#d, #h, #w]) }
+                }
+                _ => quote! { None },
+            };
+
+            Some(Field::new(
+                &self.name,
+                quote! { burn::nn::interpolate::Interpolate3d },
+                quote! {
+                    let #name = burn::nn::interpolate::Interpolate3dConfig::new()
+                        .with_output_size(#size)
+                        .with_scale_factor(#scale_factor)
+                        .with_mode(#mode)
+                        .with_align_corners(#align_corners)
+                        .init();
+                },
+            ))
         } else {
             None
         }
@@ -122,11 +155,77 @@ impl NodeCodegen for onnx_ir::node::resize::ResizeNode {
         let has_static = matches!(&self.config.scales, Some(ResizeScales::Static(_)))
             || matches!(&self.config.sizes, Some(ResizeSizes::Static(_)));
 
+        let input_rank = match &input_arg.ty {
+            ArgType::Tensor(t) => t.rank,
+            _ => panic!("Resize input must be a tensor"),
+        };
         if !has_runtime && has_static {
             // Static resize - use the field
             let field_name = syn::Ident::new(&self.name, proc_macro2::Span::call_site());
             quote! {
                 let #output = self.#field_name.forward(#input);
+            }
+        } else if input_rank == 5 {
+            // Runtime 3D resize: the sizes or scales input names every axis, the spatial three last.
+            let mode = match self.config.mode {
+                ResizeMode::Nearest => quote! { burn::tensor::ops::InterpolateMode::Nearest },
+                ResizeMode::Linear => quote! { burn::tensor::ops::InterpolateMode::Bilinear },
+                ResizeMode::Cubic => quote! { burn::tensor::ops::InterpolateMode::Bicubic },
+            };
+            let align_corners = self.config.coordinate_transformation_mode
+                == onnx_ir::node::resize::CoordinateTransformMode::AlignCorners;
+            let target = if let Some(ResizeSizes::Runtime(sizes_ref)) = &self.config.sizes {
+                let sizes_arg = &self.inputs[sizes_ref.input_index];
+                match &sizes_arg.ty {
+                    ArgType::Shape(_) => {
+                        let sizes_name = arg_to_ident(sizes_arg);
+                        quote! { [#sizes_name[2] as usize, #sizes_name[3] as usize, #sizes_name[4] as usize] }
+                    }
+                    ArgType::Tensor(_) => {
+                        let sizes_name = scope.arg(sizes_arg);
+                        quote! {{
+                            let sizes_data = #sizes_name.to_data().convert::<i64>();
+                            let sizes = sizes_data.as_slice::<i64>().unwrap();
+                            [sizes[2] as usize, sizes[3] as usize, sizes[4] as usize]
+                        }}
+                    }
+                    _ => panic!("Runtime resize sizes must be Shape or Tensor"),
+                }
+            } else if let Some(ResizeScales::Runtime(scales_ref)) = &self.config.scales {
+                let scales_arg = &self.inputs[scales_ref.input_index];
+                let scales = match &scales_arg.ty {
+                    ArgType::Shape(_) => {
+                        let scales_name = arg_to_ident(scales_arg);
+                        quote! { [#scales_name[2] as f64, #scales_name[3] as f64, #scales_name[4] as f64] }
+                    }
+                    ArgType::Tensor(_) => {
+                        let scales_name = scope.arg(scales_arg);
+                        quote! {{
+                            let scales_data = #scales_name.to_data().convert::<f32>();
+                            let scales = scales_data.as_slice::<f32>().unwrap();
+                            [scales[2] as f64, scales[3] as f64, scales[4] as f64]
+                        }}
+                    }
+                    _ => panic!("Runtime resize scales must be Shape or Tensor"),
+                };
+                quote! {{
+                    let dims = #input.dims();
+                    let scales = #scales;
+                    [
+                        (dims[2] as f64 * scales[0]) as usize,
+                        (dims[3] as f64 * scales[1]) as usize,
+                        (dims[4] as f64 * scales[2]) as usize,
+                    ]
+                }}
+            } else {
+                panic!("Runtime resize requires either sizes or scales input")
+            };
+            quote! {
+                let #output = burn::tensor::module::interpolate3d(
+                    #input,
+                    #target,
+                    burn::tensor::ops::InterpolateOptions::new(#mode).with_align_corners(#align_corners)
+                );
             }
         } else {
             // Runtime resize - use tensor operations directly
@@ -241,6 +340,32 @@ mod tests {
         CoordinateTransformMode, ResizeConfig, ResizeMode, ResizeNodeBuilder, ResizeScales,
         ResizeSizes,
     };
+
+    // ==================== Static Resize - Rank 5 (3D) Tests ====================
+
+    #[test]
+    fn test_resize_3d_static_scales_linear_field_init() {
+        let config = ResizeConfig {
+            mode: ResizeMode::Linear,
+            scales: Some(ResizeScales::Static(vec![2.0, 2.0, 2.0])),
+            sizes: None,
+            ..Default::default()
+        };
+        let node = ResizeNodeBuilder::new("upsample")
+            .input_tensor("volume", 5, DType::F32)
+            .output_tensor("upsampled", 5, DType::F32)
+            .config(config)
+            .build();
+        let code = codegen_field_init(&node);
+        assert_snapshot!(code, @r"
+        let upsample = burn::nn::interpolate::Interpolate3dConfig::new()
+            .with_output_size(None)
+            .with_scale_factor(Some([2.0, 2.0, 2.0]))
+            .with_mode(burn::nn::interpolate::InterpolateMode::Linear)
+            .with_align_corners(false)
+            .init();
+        ");
+    }
 
     // ==================== Static Resize - Rank 3 (1D) Tests ====================
 
